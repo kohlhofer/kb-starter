@@ -1,0 +1,743 @@
+#!/usr/bin/env python3
+"""kb-lint: mechanical checks and state for the knowledge workspace.
+
+Everything here is a check a script can do better than a language model
+re-reading files: link resolution, registry coverage, index drift, frontmatter
+shape, status/provenance enums, stale dates. The librarian skills run this
+first and spend their attention on judgement instead.
+
+Usage:
+  kb-lint [KB ...]                 check every KB (or the named ones)
+  kb-lint --fix [KB ...]           apply mechanical fixes, then check
+  kb-lint --nudge                  one line per KB that needs attention (session-start hook)
+  kb-lint --nudge --json           same, wrapped as a SessionStart hook payload
+  kb-lint --sample KB N            pick N articles for a delta audit, deterministically
+  kb-lint --record KB EVENT [--type delta|full]
+                                   record a compile / health-check run in kb.json
+  kb-lint --staged                 pre-commit mode: stamp Last updated on staged
+                                   articles, re-stage them, lint the touched KBs
+  kb-lint --quiet                  hide INFO lines
+
+Exit status is 1 when any ERROR was reported, else 0.
+
+No dependencies beyond the Python standard library.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+TODAY = dt.date.today()
+
+RAW_REQUIRED = ["title", "author", "source_url", "date_added", "date_published", "type"]
+STATUS_ENUM = {"established", "emerging", "speculative"}
+PROVENANCE_ENUM = {"primary", "digest", "owner-stated", "mixed"}
+OUTPUT_KINDS = {"report", "run", "ledger", "handoff", "log"}
+NAV_FILES = {"INDEX.md", "QUESTIONS.md"}
+OUTPUT_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}_[a-z0-9][a-z0-9-]*(-v\d+)?\.md$")
+STALE_DAYS = 14          # Last updated vs git commit date
+CHECK_DUE_DAYS = 45      # health check considered overdue after this
+FULL_CHECK_DAYS = 90     # a full audit is due after this
+
+DIGEST_RE = re.compile(r"digest|summary", re.I)
+OWNER_RE = re.compile(
+    r"owner statement|^note$|^note\b|chat capture|decision record|implementation log|"
+    r"working session|session record|strategy note|status update",
+    re.I,
+)
+
+LINK_RE = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")
+FIELD_RE = {  # [ \t]* not \s*: the match must stop at the end of its own line
+    "status": re.compile(r"^\*\*Status:\*\*[ \t]*(.+?)[ \t]*$", re.M),
+    "updated": re.compile(r"^\*\*Last updated:\*\*[ \t]*(.+?)[ \t]*$", re.M),
+    "sources": re.compile(r"^\*\*Sources:\*\*[ \t]*(.+?)[ \t]*$", re.M),
+    "provenance": re.compile(r"^\*\*Provenance:\*\*[ \t]*(.+?)[ \t]*$", re.M),
+}
+
+
+# --------------------------------------------------------------------------- helpers
+
+class Report:
+    def __init__(self, quiet: bool = False, errors_only: bool = False):
+        self.quiet = quiet
+        self.errors_only = errors_only
+        self.errors = 0
+        self.warnings = 0
+
+    def _emit(self, level: str, kb: str, where: str, msg: str):
+        if level == "INFO" and (self.quiet or self.errors_only):
+            return
+        if level == "WARN" and self.errors_only:
+            return
+        print(f"{kb}: {where}: {level}: {msg}")
+
+    def error(self, kb, where, msg):
+        self.errors += 1
+        self._emit("ERROR", kb, where, msg)
+
+    def warn(self, kb, where, msg):
+        self.warnings += 1
+        self._emit("WARN", kb, where, msg)
+
+    def info(self, kb, where, msg):
+        self._emit("INFO", kb, where, msg)
+
+
+def read(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return path.read_text(encoding="utf-8", errors="replace")
+
+
+def parse_frontmatter(text: str) -> dict | None:
+    """Minimal YAML-ish frontmatter: `key: value` lines between two `---` fences."""
+    if not text.startswith("---"):
+        return None
+    lines = text.splitlines()
+    fields: dict[str, str] = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            return fields
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$", line)
+        if m:
+            fields[m.group(1)] = m.group(2).strip()
+    return None  # unterminated
+
+
+def discover_kbs() -> list[Path]:
+    return sorted(p for p in ROOT.iterdir() if p.is_dir() and p.name.endswith("_kb") and (p / "CLAUDE.md").exists())
+
+
+def resolve_kbs(names: list[str]) -> list[Path]:
+    all_kbs = discover_kbs()
+    if not names:
+        return all_kbs
+    out = []
+    for n in names:
+        n = n.rstrip("/")
+        cand = [k for k in all_kbs if k.name == n or k.name == f"{n}_kb" or k.name.startswith(n)]
+        if not cand:
+            sys.exit(f"kb-lint: no knowledge base matches '{n}'")
+        out.append(cand[0])
+    return out
+
+
+def kb_json_path(kb: Path) -> Path:
+    return kb / "kb.json"
+
+
+def load_state(kb: Path) -> dict:
+    p = kb_json_path(kb)
+    data = {}
+    if p.exists():
+        try:
+            data = json.loads(read(p))
+        except json.JSONDecodeError as e:
+            sys.exit(f"kb-lint: {p} is not valid JSON: {e}")
+    data.setdefault("routes", [])
+    data.setdefault("external", [])
+    data.setdefault("state", {})
+    data["state"].setdefault("audited", {})
+    return data
+
+
+def save_state(kb: Path, data: dict):
+    kb_json_path(kb).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def git(*args: str) -> str:
+    try:
+        return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True,
+                              errors="replace", check=False).stdout
+    except FileNotFoundError:
+        return ""
+
+
+_git_dates: dict[str, str] | None = None
+_dirty: set[str] | None = None
+
+
+def git_last_commit_dates() -> dict[str, str]:
+    """Map repo-relative path -> ISO date of the last commit touching it (one git call)."""
+    global _git_dates
+    if _git_dates is not None:
+        return _git_dates
+    _git_dates = {}
+    out = git("log", "--format=%x00%cs", "--name-only", "--", ".")
+    current = None
+    for line in out.splitlines():
+        if line.startswith("\x00"):
+            current = line[1:]
+        elif line and current and line not in _git_dates:
+            _git_dates[line] = current
+    return _git_dates
+
+
+def dirty_paths() -> set[str]:
+    global _dirty
+    if _dirty is None:
+        _dirty = set()
+        for line in git("status", "--porcelain", "--untracked-files=all").splitlines():
+            if len(line) > 3:
+                _dirty.add(line[3:].strip().strip('"'))
+    return _dirty
+
+
+def rel(path: Path) -> str:
+    return str(path.relative_to(ROOT))
+
+
+META_LINE_RE = re.compile(r"^[+-](\*\*(Status|Last updated|Provenance):\*\*|\s*$)")
+DIFF_HEADER_RE = re.compile(r"^(--- |\+\+\+ )(a/|b/|/dev/null)")
+
+
+def content_changed(relpath: str, cached: bool = False) -> bool:
+    """True if the working tree (or index, with cached=True) changes this file beyond
+    its metadata header lines. Untracked files count as changed."""
+    args = ["diff", "-U0"] + (["--cached"] if cached else ["HEAD"]) + ["--", relpath]
+    out = git(*args)
+    if not out:
+        # untracked (no diff against HEAD) -> new file
+        return not git("ls-files", "--error-unmatch", relpath).strip() if not cached else False
+    for line in out.splitlines():
+        if DIFF_HEADER_RE.match(line):
+            continue
+        if line.startswith(("+", "-")) and not META_LINE_RE.match(line):
+            return True
+    return False
+
+
+_content_dates: dict[str, dict[str, str]] = {}
+
+
+def content_dates_for(tree: str) -> dict[str, str]:
+    """Map repo-relative path -> date of the last commit that changed the file's
+    content (ignoring metadata header lines). One `git log -p` per tree."""
+    if tree in _content_dates:
+        return _content_dates[tree]
+    dates: dict[str, str] = {}
+    out = git("log", "--format=%x00%cs", "-p", "-U0", "--no-color", "--", tree)
+    cur_date, cur_file, changed = None, None, set()
+    for line in out.splitlines():
+        if line.startswith("\x00"):
+            for f in changed:
+                dates.setdefault(f, cur_date)
+            changed, cur_date, cur_file = set(), line[1:], None
+        elif line.startswith("diff --git "):
+            cur_file = line.split(" b/", 1)[1] if " b/" in line else None
+        elif DIFF_HEADER_RE.match(line):
+            continue
+        elif cur_file and line[:1] in "+-" and not META_LINE_RE.match(line):
+            changed.add(cur_file)
+    for f in changed:
+        dates.setdefault(f, cur_date)
+    _content_dates[tree] = dates
+    return dates
+
+
+def effective_date(path: Path) -> str | None:
+    """Date the file's content last changed: today if it has content edits in the
+    working tree, else the last commit whose diff touched more than metadata."""
+    r = rel(path)
+    if r in dirty_paths() and content_changed(r):
+        return TODAY.isoformat()
+    tree = str(path.parent.relative_to(ROOT))
+    return content_dates_for(tree).get(r) or git_last_commit_dates().get(r)
+
+
+DASH_RE = re.compile(r"[\u2014\u2013]")
+# The voice skill allows a rare dash, at most two per piece; more is a habit.
+DASH_LIMIT = 2
+FENCE_RE = re.compile(r"```.*?```", re.S)
+QUOTE_RE = re.compile(r'"[^"\n]*"|\u201c[^\u201d\n]*\u201d|`[^`\n]*`')
+
+
+RANGE_RE = re.compile(r"(?<=[0-9%])\u2013(?=[0-9])")
+LIST_SEP_RE = re.compile(r"^(\s*[-*] \[\[[^\]]+\]\])\s+[\u2014\u2013]\s+", re.M)
+
+
+def prose_dashes(text: str) -> int:
+    """Count em/en dashes in article or report prose. Ignored, because they are
+    typography rather than prose: code fences and inline code, quoted strings
+    (direct quotes from sources are exempt from the writing rule), table rows,
+    the ` — ` separator after a [[link]] in a list item, and an en dash between
+    two numbers (a range)."""
+    body = text.split("\n## ", 1)[1] if "\n## " in text else text
+    body = FENCE_RE.sub("", body)
+    body = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("|"))
+    body = QUOTE_RE.sub("", body)
+    body = LIST_SEP_RE.sub(r"\1 ", body)
+    body = RANGE_RE.sub("-", body)
+    return len(DASH_RE.findall(body))
+
+
+def grade_for_type(t: str) -> str:
+    if DIGEST_RE.search(t):
+        return "digest"
+    if OWNER_RE.search(t):
+        return "owner-stated"
+    return "primary"
+
+
+def days_since(iso: str | None) -> int | None:
+    if not iso:
+        return None
+    try:
+        return (TODAY - dt.date.fromisoformat(iso[:10])).days
+    except ValueError:
+        return None
+
+
+# --------------------------------------------------------------------------- KB model
+
+class KB:
+    def __init__(self, path: Path):
+        self.path = path
+        self.name = path.name
+        self.raw_dir = path / "RAW"
+        self.wiki_dir = path / "Wiki"
+        self.out_dir = path / "Outputs"
+        self.state = load_state(path)
+
+        self.raw_files = sorted(
+            p for p in self.raw_dir.rglob("*") if p.is_file() and p.name != "_INGESTED.md" and not p.name.startswith(".")
+        ) if self.raw_dir.exists() else []
+        self.raw_by_stem = {p.stem: p for p in self.raw_files}
+        self.raw_by_name = {p.name: p for p in self.raw_files}
+
+        self.articles = sorted(
+            p for p in self.wiki_dir.glob("*.md") if p.name not in NAV_FILES
+        ) if self.wiki_dir.exists() else []
+        self.article_slugs = {p.stem for p in self.articles}
+
+        self.outputs = sorted(p for p in self.out_dir.glob("*") if p.is_file() and not p.name.startswith(".")) if self.out_dir.exists() else []
+        self.output_slugs = {p.stem for p in self.outputs}
+
+        self.raw_types: dict[str, str] = {}
+        for p in self.raw_files:
+            if p.suffix == ".md":
+                fm = parse_frontmatter(read(p))
+                if fm and "type" in fm:
+                    self.raw_types[p.stem] = fm["type"]
+
+    # registry -------------------------------------------------------------
+    def registry_names(self) -> set[str]:
+        """Every filename or stem the registry mentions, in any of the accepted forms."""
+        reg = self.raw_dir / "_INGESTED.md"
+        if not reg.exists():
+            return set()
+        text = read(reg)
+        names: set[str] = set()
+        for m in re.finditer(r"`([^`\n]+?)`", text):
+            names.add(m.group(1).strip())
+        for m in re.finditer(r"\*\*([^*\n]+?\.[a-z0-9]{1,5})\*\*", text):
+            names.add(m.group(1).strip())
+        for m in LINK_RE.finditer(text):
+            names.add(m.group(1).strip())
+        for m in re.finditer(r"^\|\s*([^|\n]+?)\s*\|", text, re.M):
+            names.add(m.group(1).strip().strip("`"))
+        for m in re.finditer(r"^\s*[-*]\s+\**([A-Za-z0-9][^\s`*|]*\.[a-z0-9]{1,5})\**", text, re.M):
+            names.add(m.group(1).strip())
+        stems = set()
+        for n in names:
+            stems.add(n)
+            stems.add(Path(n).stem)
+        return stems
+
+    def unregistered_raw(self) -> list[Path]:
+        reg = self.registry_names()
+        return [p for p in self.raw_files if p.name not in reg and p.stem not in reg]
+
+    # links ------------------------------------------------------------------
+    def resolves_locally(self, slug: str) -> bool:
+        return (slug in self.article_slugs or slug in self.raw_by_stem or slug in self.raw_by_name
+                or slug in self.output_slugs or slug in {"INDEX", "QUESTIONS", "STATE", "CHANGELOG"})
+
+    def is_external(self, slug: str) -> bool:
+        return any(re.search(pat, slug) for pat in self.state.get("external", []))
+
+    def derived_provenance(self, sources: list[str]) -> str | None:
+        grades = {grade_for_type(self.raw_types[s]) for s in sources if s in self.raw_types}
+        if not grades:
+            return None
+        return grades.pop() if len(grades) == 1 else "mixed"
+
+
+# --------------------------------------------------------------------------- checks
+
+def check_kb(kb: KB, all_kbs: dict[str, KB], rep: Report, fix: bool):
+    n = kb.name
+
+    for d, label in ((kb.raw_dir, "RAW/"), (kb.wiki_dir, "Wiki/"), (kb.out_dir, "Outputs/")):
+        if not d.exists():
+            if fix:
+                d.mkdir(parents=True)
+                (d / ".gitkeep").touch()
+                rep.info(n, label, "created (was missing)")
+            else:
+                rep.error(n, label, "folder missing")
+    for f in ("CHANGELOG.md", "STATE.md", "Wiki/INDEX.md", "Wiki/QUESTIONS.md", "RAW/_INGESTED.md", "kb.json"):
+        if not (kb.path / f).exists():
+            if f == "kb.json" and fix:
+                save_state(kb.path, kb.state)
+                rep.info(n, f, "created with defaults")
+            else:
+                rep.error(n, f, "file missing")
+
+    # RAW frontmatter --------------------------------------------------------
+    for p in kb.raw_files:
+        if p.suffix != ".md":
+            if not (p.with_suffix(".md")).exists() and not (p.parent / (p.name + ".md")).exists():
+                rep.warn(n, f"RAW/{p.name}", "non-markdown source has no sidecar .md with frontmatter")
+            continue
+        fm = parse_frontmatter(read(p))
+        where = f"RAW/{p.name}"
+        if fm is None:
+            rep.error(n, where, "no frontmatter block")
+            continue
+        missing = [k for k in RAW_REQUIRED if k not in fm]
+        if missing:
+            rep.error(n, where, f"frontmatter missing {', '.join(missing)}")
+        da = fm.get("date_added", "")
+        if da and not re.match(r"^\d{4}-\d{2}-\d{2}", da):
+            rep.error(n, where, f"date_added is not YYYY-MM-DD: {da!r}")
+        for k in ("title", "type"):
+            if k in fm and not fm[k]:
+                rep.error(n, where, f"frontmatter {k} is empty")
+
+    # registry coverage --------------------------------------------------------
+    unreg = kb.unregistered_raw()
+    for p in unreg:
+        rep.warn(n, f"RAW/{p.name}", "not in _INGESTED.md (uncompiled?)")
+    reg = kb.raw_dir / "_INGESTED.md"
+    if reg.exists():
+        mentioned = kb.registry_names()
+        present = set(kb.raw_by_stem) | set(kb.raw_by_name)
+        for m in sorted(mentioned):
+            if m in present or Path(m).stem in present:
+                continue
+            # only flag things that look like filenames, not prose in backticks
+            if re.match(r"^[a-z0-9][a-z0-9._-]*\.md$", m):
+                rep.warn(n, "RAW/_INGESTED.md", f"registered but no such file: {m}")
+
+    # wiki articles --------------------------------------------------------------
+    index_text = read(kb.wiki_dir / "INDEX.md") if (kb.wiki_dir / "INDEX.md").exists() else ""
+    index_links = set(LINK_RE.findall(index_text)) | set(re.findall(r"\(([a-z0-9-]+)\.md\)", index_text)) | set(re.findall(r"`([a-z0-9-]+)\.md`", index_text))
+
+    for p in kb.articles:
+        where = f"Wiki/{p.name}"
+        text = read(p)
+        changed = False
+
+        if not re.match(r"^[a-z0-9][a-z0-9-]*$", p.stem):
+            rep.warn(n, where, "filename is not kebab-case")
+
+        m = FIELD_RE["status"].search(text)
+        if not m:
+            rep.error(n, where, "no **Status:** line")
+        elif m.group(1) not in STATUS_ENUM:
+            rep.error(n, where, f"Status must be one of {sorted(STATUS_ENUM)}, got {m.group(1)!r}")
+
+        # sources + provenance
+        ms = FIELD_RE["sources"].search(text)
+        sources = LINK_RE.findall(ms.group(1)) if ms else []
+        if not ms:
+            rep.error(n, where, "no **Sources:** line")
+        else:
+            raw_srcs = []
+            for s in sources:
+                if s in kb.raw_by_stem or s in kb.raw_by_name:
+                    raw_srcs.append(s)
+                elif s in kb.article_slugs:
+                    rep.info(n, where, f"Sources cites a wiki article, not RAW: [[{s}]]")
+                elif s in kb.output_slugs:
+                    rep.info(n, where, f"Sources cites an output, not RAW: [[{s}]]")
+                elif kb.is_external(s):
+                    rep.info(n, where, f"Sources cites a declared external document: [[{s}]]")
+                else:
+                    rep.error(n, where, f"Sources cites something that does not exist: [[{s}]]")
+            if not raw_srcs and sources:
+                rep.warn(n, where, "no RAW file among Sources")
+            derived = kb.derived_provenance(raw_srcs)
+            mp = FIELD_RE["provenance"].search(text)
+            if not mp:
+                if fix and derived:
+                    text = FIELD_RE["sources"].sub(lambda mm: f"{mm.group(0)}\n**Provenance:** {derived}", text, count=1)
+                    changed = True
+                    rep.info(n, where, f"Provenance set to {derived} (derived from RAW types)")
+                else:
+                    rep.error(n, where, "no **Provenance:** line" + (f" (derived: {derived})" if derived else ""))
+            elif mp.group(1) not in PROVENANCE_ENUM:
+                rep.error(n, where, f"Provenance must be one of {sorted(PROVENANCE_ENUM)}, got {mp.group(1)!r}")
+            elif derived and mp.group(1) != derived:
+                rep.warn(n, where, f"Provenance says {mp.group(1)} but cited RAW types derive {derived}")
+
+        # last updated vs git
+        mu = FIELD_RE["updated"].search(text)
+        eff = effective_date(p)
+        if not mu:
+            rep.error(n, where, "no **Last updated:** line")
+        else:
+            field = mu.group(1)
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", field):
+                rep.error(n, where, f"Last updated is not YYYY-MM-DD: {field!r}")
+            elif eff and eff > field:
+                gap = (dt.date.fromisoformat(eff) - dt.date.fromisoformat(field)).days
+                if gap > STALE_DAYS:
+                    if fix:
+                        text = FIELD_RE["updated"].sub(f"**Last updated:** {eff}", text, count=1)
+                        changed = True
+                        rep.info(n, where, f"Last updated {field} -> {eff} (from git)")
+                    else:
+                        rep.warn(n, where, f"Last updated {field} but file changed {eff} (+{gap}d); run --fix")
+
+        # links
+        for slug in sorted(set(LINK_RE.findall(text))):
+            slug = slug.strip()
+            if kb.resolves_locally(slug):
+                continue
+            if kb.is_external(slug):
+                rep.info(n, where, f"[[{slug}]] is a declared external document")
+                continue
+            hit = [r for r in kb.state["routes"] if r in all_kbs and all_kbs[r].resolves_locally(slug)]
+            if hit:
+                rep.info(n, where, f"[[{slug}]] resolves in routed KB {hit[0]}")
+            else:
+                other = [o.name for o in all_kbs.values() if o.name != n and o.resolves_locally(slug)]
+                if other:
+                    rep.error(n, where, f"[[{slug}]] only exists in {other[0]}, which is not in kb.json routes")
+                else:
+                    rep.error(n, where, f"broken link [[{slug}]]")
+
+        if p.stem not in index_links:
+            rep.error(n, "Wiki/INDEX.md", f"article not indexed: {p.stem}")
+
+        nd = prose_dashes(text)
+        if nd > DASH_LIMIT:
+            rep.warn(n, where, f"{nd} em/en dashes in prose; the voice allows at most {DASH_LIMIT} (run the humanizer pass)")
+
+        if changed:
+            p.write_text(text, encoding="utf-8")
+
+    for slug in sorted(index_links):
+        if slug not in kb.article_slugs and slug not in NAV_FILES and slug not in {"INDEX", "QUESTIONS"}:
+            if not kb.resolves_locally(slug):
+                rep.error(n, "Wiki/INDEX.md", f"indexed but no such article: {slug}")
+
+    # QUESTIONS links
+    q = kb.wiki_dir / "QUESTIONS.md"
+    if q.exists():
+        for slug in sorted(set(LINK_RE.findall(read(q)))):
+            if kb.resolves_locally(slug):
+                continue
+            if any(r in all_kbs and all_kbs[r].resolves_locally(slug) for r in kb.state["routes"]):
+                continue
+            rep.warn(n, "Wiki/QUESTIONS.md", f"unresolved link [[{slug}]] (fine if it names a future article)")
+
+    # outputs ----------------------------------------------------------------------
+    for p in kb.outputs:
+        where = f"Outputs/{p.name}"
+        if p.suffix != ".md":
+            rep.info(n, where, "non-markdown output (allowed, not linted)")
+            continue
+        if not OUTPUT_NAME.match(p.name):
+            rep.warn(n, where, "name should be YYYY-MM-DD_kebab-slug.md")
+        text = read(p)
+        fm = parse_frontmatter(text) or {}
+        kind = fm.get("kind", "report")
+        if kind not in OUTPUT_KINDS:
+            rep.error(n, where, f"kind must be one of {sorted(OUTPUT_KINDS)}, got {kind!r}")
+        links = set(LINK_RE.findall(text))
+        if kind == "report" and not links:
+            rep.warn(n, where, "report cites no [[wiki or RAW]] source; add citations or set kind: run|log|handoff|ledger")
+        if kind == "report":
+            nd = prose_dashes(text)
+            if nd > DASH_LIMIT:
+                rep.warn(n, where, f"{nd} em/en dashes in prose; the voice allows at most {DASH_LIMIT} (run the humanizer pass)")
+        for slug in sorted(links):
+            if kb.resolves_locally(slug) or kb.is_external(slug):
+                continue
+            if any(r in all_kbs and all_kbs[r].resolves_locally(slug) for r in kb.state["routes"]):
+                continue
+            other = [o.name for o in all_kbs.values() if o.name != n and o.resolves_locally(slug)]
+            if other:
+                rep.error(n, where, f"[[{slug}]] only exists in {other[0]}, which is not in kb.json routes")
+            else:
+                rep.error(n, where, f"broken link [[{slug}]]")
+
+    # routes must exist
+    for r in kb.state["routes"]:
+        if r not in all_kbs:
+            rep.error(n, "kb.json", f"route to unknown KB {r!r}")
+
+
+# --------------------------------------------------------------------------- nudge
+
+def nudge_lines(kbs: list[KB]) -> list[str]:
+    lines = []
+    for kb in kbs:
+        notes = []
+        unreg = kb.unregistered_raw()
+        if unreg:
+            notes.append(f"{len(unreg)} RAW file{'s' if len(unreg) != 1 else ''} not compiled")
+        hc = kb.state["state"].get("last_health_check")
+        age = days_since(hc.get("date")) if isinstance(hc, dict) else None
+        if age is None:
+            notes.append("no health check recorded (start with a full one)")
+        elif age > CHECK_DUE_DAYS:
+            notes.append(f"last health check {age} days ago")
+        full_age = days_since(kb.state["state"].get("last_full_check"))
+        if age is not None and age <= CHECK_DUE_DAYS and (full_age is None or full_age > FULL_CHECK_DAYS):
+            notes.append("full audit due")
+        dirty = [d for d in dirty_paths() if d.startswith(kb.name + "/")]
+        if dirty:
+            notes.append(f"{len(dirty)} uncommitted file{'s' if len(dirty) != 1 else ''}")
+        if notes:
+            lines.append(f"{kb.name}: " + "; ".join(notes))
+    return lines
+
+
+# --------------------------------------------------------------------------- sample / record
+
+def sample(kb: KB, count: int) -> list[str]:
+    audited = kb.state["state"]["audited"]
+    ranked = sorted(kb.article_slugs, key=lambda s: (audited.get(s, "0000-00-00"), s))
+    picked = ranked[:count]
+    for s in picked:
+        audited[s] = TODAY.isoformat()
+    save_state(kb.path, kb.state)
+    return picked
+
+
+def record(kb: KB, event: str, kind: str | None):
+    st = kb.state["state"]
+    if event in ("health-check", "check"):
+        kind = kind or "delta"
+        st["last_health_check"] = {"date": TODAY.isoformat(), "type": kind}
+        if kind == "full":
+            st["last_full_check"] = TODAY.isoformat()
+            for s in kb.article_slugs:
+                st["audited"][s] = TODAY.isoformat()
+    elif event == "compile":
+        st["last_compile"] = TODAY.isoformat()
+    else:
+        sys.exit(f"kb-lint: unknown event {event!r} (use compile | health-check)")
+    save_state(kb.path, kb.state)
+    print(f"{kb.name}: recorded {event}" + (f" ({kind})" if kind and event != "compile" else ""))
+
+
+# --------------------------------------------------------------------------- staged
+
+def staged_mode(rep: Report) -> int:
+    staged = [l for l in git("diff", "--cached", "--name-only").splitlines() if l]
+    if not staged:
+        return 0
+    touched_kbs = sorted({s.split("/")[0] for s in staged if s.endswith("_kb") or "_kb/" in s})
+    restage = []
+    for s in staged:
+        parts = s.split("/")
+        if len(parts) == 3 and parts[1] == "Wiki" and parts[2].endswith(".md") and parts[2] not in NAV_FILES:
+            p = ROOT / s
+            if not p.exists():
+                continue
+            if not content_changed(s, cached=True):
+                continue
+            text = read(p)
+            m = FIELD_RE["updated"].search(text)
+            if m and m.group(1) != TODAY.isoformat():
+                p.write_text(FIELD_RE["updated"].sub(f"**Last updated:** {TODAY.isoformat()}", text, count=1), encoding="utf-8")
+                restage.append(s)
+    if restage:
+        subprocess.run(["git", "add", *restage], cwd=ROOT, check=False)
+        for s in restage:
+            print(f"kb-lint: stamped Last updated {TODAY.isoformat()} on {s}")
+    if not touched_kbs:
+        return 0
+    kbs = [KB(ROOT / k) for k in touched_kbs if (ROOT / k / "CLAUDE.md").exists()]
+    all_kbs = {k.name: k for k in (KB(p) for p in discover_kbs())}
+    rep.errors_only = True  # a hook that prints warnings on every commit gets ignored
+    for kb in kbs:
+        check_kb(kb, all_kbs, rep, fix=False)
+    if rep.warnings:
+        print(f"kb-lint: {rep.warnings} warning(s) in {', '.join(k.name for k in kbs)}; run bin/kb-lint to see them")
+    return 1 if rep.errors else 0
+
+
+# --------------------------------------------------------------------------- main
+
+def main(argv: list[str]) -> int:
+    args = list(argv)
+    quiet = "--quiet" in args
+    fix = "--fix" in args
+    as_json = "--json" in args
+    for flag in ("--quiet", "--fix", "--json"):
+        while flag in args:
+            args.remove(flag)
+
+    rep = Report(quiet=quiet)
+
+    if args and args[0] == "--nudge":
+        kbs = [KB(p) for p in discover_kbs()]
+        lines = nudge_lines(kbs)
+        if as_json:
+            if lines:
+                ctx = ("Knowledge workspace status (from bin/kb-lint --nudge). Mention the relevant line once, "
+                       "in your first reply, if the user works in that KB; suggest 'compile' or 'run a health check' as appropriate. "
+                       "Do not act on it unasked.\n" + "\n".join("- " + l for l in lines))
+                print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
+            return 0
+        for l in lines:
+            print(l)
+        return 0
+
+    if args and args[0] == "--sample":
+        if len(args) < 3:
+            sys.exit("usage: kb-lint --sample KB N")
+        kb = KB(resolve_kbs([args[1]])[0])
+        for s in sample(kb, int(args[2])):
+            print(s)
+        return 0
+
+    if args and args[0] == "--record":
+        if len(args) < 3:
+            sys.exit("usage: kb-lint --record KB compile|health-check [--type delta|full]")
+        kind = None
+        if "--type" in args:
+            kind = args[args.index("--type") + 1]
+        kb = KB(resolve_kbs([args[1]])[0])
+        record(kb, args[2], kind)
+        return 0
+
+    if args and args[0] == "--staged":
+        return staged_mode(rep)
+
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+
+    targets = resolve_kbs(args)
+    all_kbs = {p.name: KB(p) for p in discover_kbs()}
+    for p in targets:
+        check_kb(all_kbs[p.name], all_kbs, rep, fix=fix)
+    if fix:
+        # second pass so fixes are verified and counts reflect the final state
+        rep2 = Report(quiet=True)
+        all_kbs = {p.name: KB(p) for p in discover_kbs()}
+        for p in targets:
+            check_kb(all_kbs[p.name], all_kbs, rep2, fix=False)
+        rep.errors, rep.warnings = rep2.errors, rep2.warnings
+    print(f"kb-lint: {len(targets)} KB(s), {rep.errors} error(s), {rep.warnings} warning(s)")
+    return 1 if rep.errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

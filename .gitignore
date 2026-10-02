@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# Editor / tooling cruft
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Local Claude Code overrides (machine-specific)
+.claude/settings.local.json
+
+# RAW is tracked by default — this KB system relies on source provenance.
+# If RAW starts collecting large binaries you'd rather keep out of git,
+# uncomment and adjust:
+# *_kb/RAW/**/*.pdf
+# *_kb/RAW/**/*.mp3
+# *_kb/RAW/**/*.mp4
+# *_kb/RAW/**/*.mov
+
+# Python bytecode from bin/kb-lint
+__pycache__/
