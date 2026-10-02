@@ -32,4 +32,6 @@ Every file here is plain markdown, so any editor works. I read mine in [Markdown
 
 ## Where This Came From
 
-The system started as a Karpathy-style knowledge base kit for Claude Code. Its creator's [walkthrough video](https://youtu.be/ib74sLgjIBM) is the best introduction to the idea, so watch it before your first build. Most of what's here has been rebuilt since, including the skills and the lint.
+The idea is Andrej Karpathy's. His [post on LLM knowledge bases](https://x.com/karpathy/status/2039805659525644595) describes the core loop: sources go into a raw folder, an LLM compiles them into a markdown wiki, your questions get answered against it, and the answers get filed back so the knowledge base keeps adding up.
+
+This workspace started as a kit built on that post, and the kit's creator made a [walkthrough video](https://youtu.be/ib74sLgjIBM) that is the best introduction to the idea, so watch it before your first build. Most of what's here has been rebuilt since, including the skills and the lint.

@@ -1,6 +1,6 @@
 # KNOWLEDGE
 
-This folder is a local second brain: one or more knowledge bases, each on a single topic, that get smarter the longer they are used. The pattern is Andrej Karpathy's LLM knowledge base, run locally with Claude as the librarian. Sources go into a knowledge base's `RAW/` folder verbatim; the librarian distils them into linked articles in `Wiki/`; questions are answered against the corpus with source provenance.
+This folder is a local second brain: one or more knowledge bases, each on a single topic, that get smarter the longer they are used. The pattern is Andrej Karpathy's [LLM knowledge base](https://x.com/karpathy/status/2039805659525644595), run locally with Claude as the librarian. Sources go into a knowledge base's `RAW/` folder verbatim; the librarian distils them into linked articles in `Wiki/`; questions are answered against the corpus with source provenance.
 
 This file is the map and the invariants. The procedures live in skills under `.claude/skills/kb-*`, and the mechanical checks live in `bin/kb-lint`. Each knowledge base's own `CLAUDE.md` holds only what is specific to that knowledge base.
 
